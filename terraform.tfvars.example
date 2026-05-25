@@ -9,4 +9,3 @@ region              = "nyc3"
 size                = "s-1vcpu-1gb"
 app_port            = 8000
 deploy_password     = "a-strong-password-for-sudo"
-start_command       = "uvicorn main:app --host 0.0.0.0 --port 8000"

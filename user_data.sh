@@ -19,13 +19,7 @@ ufw --force enable
 apt-get install -y git
 
 # -----------------------------------------------------------------------------
-# Step 4 — Install uv (Python toolchain)
-# Installs to /root/.local/bin/uv — referenced by full path in later steps
-# -----------------------------------------------------------------------------
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# -----------------------------------------------------------------------------
-# Step 5 — Create the deploy user with sudo privileges
+# Step 4 — Create the deploy user with sudo privileges
 # deploy is the human operator account — it can run privileged commands
 # explicitly via sudo, but is not root
 # -----------------------------------------------------------------------------
@@ -34,7 +28,7 @@ echo "deploy:${deploy_password}" | chpasswd
 usermod -aG sudo deploy
 
 # -----------------------------------------------------------------------------
-# Step 6 — Copy SSH authorized keys to the deploy user
+# Step 5 — Copy SSH authorized keys to the deploy user
 # The droplet was provisioned with root's SSH key via the DigitalOcean API.
 # This copies it so the same key works for the deploy user.
 # Permissions must be strict — SSH refuses keys that are too open.
@@ -46,7 +40,7 @@ chmod 700 /home/deploy/.ssh
 chmod 600 /home/deploy/.ssh/authorized_keys
 
 # -----------------------------------------------------------------------------
-# Step 7 — Disable root SSH login and password authentication
+# Step 6 — Disable root SSH login and password authentication
 # PermitRootLogin no: removes root as an SSH target entirely
 # PasswordAuthentication no: only key-based login is accepted,
 # making brute-force attacks impossible
@@ -64,62 +58,60 @@ fi
 systemctl restart ssh
 
 # -----------------------------------------------------------------------------
-# Step 8 — Create a dedicated system user to run the app
-# No home directory, no login shell — this account cannot be used
-# interactively, limiting what an attacker can do if the app is compromised
+# Step 7 — Install Docker
+# Uses Docker's official convenience script.
+# Adds deploy to the docker group so the systemd service can run docker
+# commands as deploy without needing sudo.
 # -----------------------------------------------------------------------------
-useradd --system --no-create-home --shell /usr/sbin/nologin appuser
+curl -fsSL https://get.docker.com | sh
+usermod -aG docker deploy
 
 # -----------------------------------------------------------------------------
-# Step 9 — Clone the repository and assign ownership to appuser
-# /opt is the conventional location for third-party apps on Linux
+# Step 8 — Clone the repository
+# Owned by deploy since deploy will build and manage the container
 # -----------------------------------------------------------------------------
 git clone ${repo_url} /opt/myapp
-chown -R appuser:appuser /opt/myapp
+chown -R deploy:deploy /opt/myapp
 
 # -----------------------------------------------------------------------------
-# Step 10 — Create virtual environment and install dependencies as appuser
-# Running as appuser ensures the venv is owned by the app process,
-# not root — consistent with least privilege
+# Step 9 — Build the Docker image
+# Reads the Dockerfile in the repo and produces a local image named myapp
 # -----------------------------------------------------------------------------
-sudo -u appuser bash -c "
-    cd /opt/myapp
-    /root/.local/bin/uv venv
-    /opt/myapp/.venv/bin/pip install -r requirements.txt
-"
+docker build -t myapp /opt/myapp
 
 # -----------------------------------------------------------------------------
-# Step 11 — Open the app port in UFW
+# Step 10 — Open the app port in UFW
 # Done after enabling UFW so the rule is added to an active firewall
 # -----------------------------------------------------------------------------
 ufw allow ${app_port}
 
 # -----------------------------------------------------------------------------
-# Step 12 — Create systemd service
-# Runs as appuser with additional sandboxing:
-#   NoNewPrivileges: prevents the process from escalating its own privileges
-#   PrivateTmp: gives the process an isolated /tmp
+# Step 11 — Create systemd service
+# Runs as deploy (who is in the docker group).
+# ExecStartPre cleans up any leftover container from a previous run —
+# the leading - means systemd ignores failure if no container exists yet.
+# Requires=docker.service ensures the Docker daemon is running first.
 # -----------------------------------------------------------------------------
 cat > /etc/systemd/system/myapp.service << 'SYSTEMD_EOF'
 [Unit]
 Description=My app
-After=network.target
+After=network.target docker.service
+Requires=docker.service
 
 [Service]
-User=appuser
-Group=appuser
-WorkingDirectory=/opt/myapp
-ExecStart=/opt/myapp/.venv/bin/${start_command}
+User=deploy
 Restart=on-failure
-NoNewPrivileges=true
-PrivateTmp=true
+ExecStartPre=-/usr/bin/docker stop myapp
+ExecStartPre=-/usr/bin/docker rm myapp
+ExecStart=/usr/bin/docker run --name myapp -p ${app_port}:${app_port} myapp
+ExecStop=/usr/bin/docker stop myapp
 
 [Install]
 WantedBy=multi-user.target
 SYSTEMD_EOF
 
 # -----------------------------------------------------------------------------
-# Step 13 — Enable and start the service
+# Step 12 — Enable and start the service
 # enable: starts automatically on every boot
 # start: starts it right now without rebooting
 # -----------------------------------------------------------------------------

@@ -61,6 +61,5 @@ resource "digitalocean_droplet" "app" {
     repo_url        = var.repo_url
     app_port        = var.app_port
     deploy_password = var.deploy_password
-    start_command   = var.start_command
   })
 }

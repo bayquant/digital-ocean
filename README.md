@@ -151,42 +151,39 @@ git --version   # confirm it installed
 
 Git is not always present on a minimal droplet image. You need it to clone your repo and pull updates later.
 
-### Step 9 — Install uv (Python toolchain)
+### Step 9 — Install Docker
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source ~/.bashrc   # reload PATH so the uv binary is found
-uv --version       # confirm it installed
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker deploy
 ```
 
-`uv` manages both Python versions and virtual environments. It replaces separate installs of `python3`, `pip`, and `venv`. Reloading the shell profile is required because the installer adds `uv` to `~/.local/bin`, which isn't in `PATH` until the profile is re-read.
+Docker packages your app and all its dependencies into a self-contained image that runs the same way on any machine. The official convenience script (`get.docker.com`) installs Docker's latest stable release from Docker's own package repository.
 
-### Step 10 — Create a dedicated system user for the app
+`usermod -aG docker deploy` adds `deploy` to the `docker` group. By default, only root can run Docker commands. The `docker` group is a way to grant that ability to a normal user without giving them full sudo. This matters because the systemd service in Step 13 will run as `deploy` — it needs to be in the docker group to start and stop containers.
 
-```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin appuser
-```
-
-The app process should run with the minimum permissions it needs — not as `deploy` (which has sudo) and certainly not as root. A system user with no home directory and no login shell cannot be used to open an interactive session, so even if the app is compromised, the attacker gets a heavily restricted account.
-
-### Step 11 — Clone the repository
+### Step 10 — Clone the repository
 
 ```bash
 sudo git clone YOUR_REPO_URL /opt/myapp
-sudo chown -R appuser:appuser /opt/myapp
+sudo chown -R deploy:deploy /opt/myapp
 ```
 
-`/opt` is the conventional location for third-party applications on Linux. Assigning ownership to `appuser` means the app process can read and write its own files but has no access to anything else on the system.
+`/opt` is the conventional location for third-party applications on Linux. The repo is owned by `deploy` (rather than root) because `deploy` will be the one building the image and managing the container.
 
-### Step 12 — Create a virtual environment and install dependencies
+### Step 11 — Build the Docker image
 
 ```bash
-sudo -u appuser bash -c "cd /opt/myapp && uv venv && .venv/bin/pip install -r requirements.txt"
+cd /opt/myapp
+docker build -t myapp .
 ```
 
-Running this as `appuser` ensures the virtual environment and installed packages are owned by the app user, not by `deploy` or root. A virtual environment isolates the app's packages so system upgrades cannot silently break it.
+`docker build` reads the `Dockerfile` in your repo and produces a local image. It installs your app's dependencies inside the image so the server doesn't need a language runtime, a virtual environment, or any of your app's packages installed directly — everything is bundled inside the image.
 
-### Step 13 — Open the app's port in the firewall
+- `-t myapp` gives the image a name so you can refer to it later
+- `.` tells Docker to look for the `Dockerfile` in the current directory
+
+### Step 12 — Open the app's port in the firewall
 
 ```bash
 sudo ufw allow YOUR_APP_PORT
@@ -195,27 +192,27 @@ sudo ufw status
 
 Replace `YOUR_APP_PORT` with whichever port your app listens on (e.g. 8000). This must be done after enabling UFW (Step 3) so the rule is added to an already-active firewall.
 
-### Step 14 — Create a systemd service
+### Step 13 — Create a systemd service
 
 ```bash
 sudo nano /etc/systemd/system/myapp.service
 ```
 
-Paste the following, replacing `YOUR_START_COMMAND`:
+Paste the following, replacing `YOUR_APP_PORT`:
 
 ```ini
 [Unit]
 Description=My app
-After=network.target
+After=network.target docker.service
+Requires=docker.service
 
 [Service]
-User=appuser
-Group=appuser
-WorkingDirectory=/opt/myapp
-ExecStart=/opt/myapp/.venv/bin/YOUR_START_COMMAND
+User=deploy
 Restart=on-failure
-NoNewPrivileges=true
-PrivateTmp=true
+ExecStartPre=-/usr/bin/docker stop myapp
+ExecStartPre=-/usr/bin/docker rm myapp
+ExecStart=/usr/bin/docker run --name myapp -p YOUR_APP_PORT:YOUR_APP_PORT myapp
+ExecStop=/usr/bin/docker stop myapp
 
 [Install]
 WantedBy=multi-user.target
@@ -223,14 +220,16 @@ WantedBy=multi-user.target
 
 `systemd` is the Linux-native service manager — the right tool for keeping a process running persistently. Do not use `screen` or `nohup`: they don't survive reboots and don't restart the app on crash.
 
-- `User=appuser` — runs the process as the restricted app user, not root or deploy
-- `After=network.target` — waits for networking before starting so the app can bind its port
+- `Requires=docker.service` — the container can't run without the Docker daemon; this tells systemd to start Docker first and stop this service if Docker stops
+- `After=network.target docker.service` — waits for both networking and Docker to be ready before starting
+- `User=deploy` — runs as `deploy` (who is in the docker group), not root
+- `ExecStartPre=-/usr/bin/docker stop myapp` — stops any leftover container from a previous run before starting a new one; the `-` prefix means systemd ignores this if the container doesn't exist yet
+- `ExecStartPre=-/usr/bin/docker rm myapp` — removes the stopped container so `docker run` can reuse the name
+- `--name myapp` — names the running container so `ExecStop` can reference it
 - `Restart=on-failure` — restarts automatically if the process exits with an error
-- `NoNewPrivileges=true` — prevents the process from escalating its own privileges
-- `PrivateTmp=true` — gives the process an isolated `/tmp`, so it cannot read temp files from other processes
 - `WantedBy=multi-user.target` — registers the service to start on normal system boot
 
-### Step 15 — Enable and start the service
+### Step 14 — Enable and start the service
 
 ```bash
 sudo systemctl daemon-reload        # tells systemd to read the new unit file
@@ -241,7 +240,7 @@ sudo systemctl status myapp         # confirm it is active and running
 
 `enable` and `start` are separate operations. `enable` alone does not start the service immediately. `start` alone does not persist across reboots. You need both.
 
-### Step 16 — Verify the app is reachable
+### Step 15 — Verify the app is reachable
 
 ```bash
 curl http://localhost:YOUR_APP_PORT
@@ -251,13 +250,18 @@ If the app responds, it is up and listening. Then test from outside by visiting 
 
 ---
 
+> **Docker Compose alternative**
+> Instead of a long `docker run` command in the service file, you can put the same configuration into a `docker-compose.yml` file in your repo and deploy with `docker compose up -d`. The Docker installation is identical — only the run step changes. Compose becomes especially useful if you later add a database or cache, since each service is just another entry in the file rather than another long `docker run` command.
+
+---
+
 ## Updating the app
 
 ```bash
 ssh deploy@YOUR_DROPLET_IP
 cd /opt/myapp
-sudo git pull
-sudo chown -R appuser:appuser /opt/myapp
+git pull
+docker build -t myapp .
 sudo systemctl restart myapp
 sudo systemctl status myapp
 ```
@@ -267,10 +271,11 @@ sudo systemctl status myapp
 ## Useful commands
 
 ```bash
-sudo journalctl -u myapp -f              # tail live logs
-sudo systemctl stop myapp               # stop the app
-sudo systemctl restart myapp            # restart after changes
-sudo fuser -k YOUR_APP_PORT/tcp         # kill anything else holding the port
+docker logs myapp -f             # tail live app logs
+sudo journalctl -u myapp -f      # systemd-level logs (start/stop events)
+sudo systemctl stop myapp        # stop the app
+sudo systemctl restart myapp     # restart after changes
+docker images                    # list built images on the server
 ```
 
 ---
@@ -330,11 +335,33 @@ Terraform automates everything in the manual guide except one step: verifying th
 The bootstrap script (`user_data.sh`) runs once on first boot and handles:
 - System updates
 - UFW firewall setup
-- Installing git and uv
+- Installing git and Docker
 - Creating the `deploy` sudo user and copying your SSH key to them
 - Disabling root SSH login and password authentication
-- Creating the restricted `appuser` to run the app
-- Cloning the repo, installing dependencies, and starting the app as a systemd service
+- Cloning the repo and building the Docker image
+- Starting the app as a systemd service running as `deploy`
+
+### Generating a DigitalOcean API token
+
+Go to the DigitalOcean dashboard → API → Generate New Token → choose **Custom Scopes**.
+
+Select the following scopes:
+
+| Resource | Permissions |
+|---|---|
+| `droplet` | Create, Read, Update, Delete |
+| `firewall` | Create, Read, Update, Delete |
+| `ssh_key` | Create, Read, Update, Delete |
+| `regions` | Read |
+| `sizes` | Read |
+| `image` | Read |
+| `actions` | Read |
+| `snapshot` | Read |
+| `vpc` | Read |
+
+The last four (`image`, `actions`, `snapshot`, `vpc`) are dependencies that DigitalOcean requires alongside the droplet scope — Terraform needs them under the hood even though you're not creating those resources directly. Select nothing else.
+
+Copy the generated token immediately — DigitalOcean only shows it once.
 
 ### Setup
 
@@ -348,9 +375,9 @@ Open `terraform.tfvars` and fill in all values. The required ones:
 | Variable | Description |
 |---|---|
 | `do_token` | DigitalOcean API token |
-| `repo_url` | HTTPS URL of your GitHub repo |
+| `repo_url` | HTTPS URL of your GitHub repo (must contain a Dockerfile) |
 | `deploy_password` | Password for the `deploy` user (used for sudo) |
-| `start_command` | Command to start the app (e.g. `uvicorn main:app --host 0.0.0.0 --port 8000`) |
+| `app_port` | Port your app listens on inside the container |
 
 ### Apply
 
@@ -389,8 +416,9 @@ terraform destroy
 
 | Problem | Fix |
 |---|---|
+| App starts but isn't reachable | Check `sudo ufw status` — the port may not be open |
+| Container exits immediately | `docker logs myapp` to see the error from inside the container |
+| `docker build` fails | Confirm a `Dockerfile` exists in the repo root and the build succeeds locally first |
 | Port already in use | `sudo fuser -k YOUR_APP_PORT/tcp` |
-| `uv: command not found` | `source ~/.bashrc` or `export PATH="$HOME/.local/bin:$PATH"` |
-| App starts but isn't reachable | Check `ufw status` — the port may not be open |
-| Updated code not showing | `sudo git pull` then `sudo systemctl restart myapp` |
-| Service fails to start | `sudo journalctl -u myapp -n 50` to see the error |
+| Updated code not showing | `git pull && docker build -t myapp . && sudo systemctl restart myapp` |
+| Service fails to start | `sudo journalctl -u myapp -n 50` to see systemd-level errors |

@@ -44,8 +44,3 @@ variable "deploy_password" {
   type        = string
   sensitive   = true
 }
-
-variable "start_command" {
-  description = "Command to start the app, relative to the venv bin directory (e.g. 'uvicorn main:app --host 0.0.0.0 --port 8000')"
-  type        = string
-}
