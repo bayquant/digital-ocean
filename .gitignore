@@ -5,3 +5,8 @@ terraform.tfstate.backup
 terraform.tfvars
 *.tfvars
 !*.tfvars.example
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
