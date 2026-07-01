@@ -44,3 +44,9 @@ variable "deploy_password" {
   type        = string
   sensitive   = true
 }
+
+variable "project_name" {
+  description = "DigitalOcean project to place the droplet in (created if it doesn't exist)"
+  type        = string
+  default     = "bay-quant"
+}

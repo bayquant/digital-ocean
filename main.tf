@@ -48,6 +48,16 @@ resource "digitalocean_firewall" "app" {
   }
 }
 
+# Project — groups resources together in the DO dashboard
+resource "digitalocean_project" "main" {
+  name = var.project_name
+}
+
+resource "digitalocean_project_resources" "main" {
+  project   = digitalocean_project.main.id
+  resources = [digitalocean_droplet.app.urn]
+}
+
 # The droplet
 resource "digitalocean_droplet" "app" {
   name     = var.app_name
