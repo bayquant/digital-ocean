@@ -50,7 +50,8 @@ resource "digitalocean_firewall" "app" {
 
 # Project — groups resources together in the DO dashboard
 resource "digitalocean_project" "main" {
-  name = var.project_name
+  name       = var.project_name
+  is_default = true
 }
 
 resource "digitalocean_project_resources" "main" {
