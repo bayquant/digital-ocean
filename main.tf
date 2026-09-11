@@ -17,7 +17,7 @@ resource "digitalocean_ssh_key" "default" {
   public_key = file(var.ssh_public_key_path)
 }
 
-# Firewall — only allow SSH and app port
+# Firewall: only allow SSH and app port
 resource "digitalocean_firewall" "app" {
   name = "${var.app_name}-firewall"
 
@@ -48,7 +48,7 @@ resource "digitalocean_firewall" "app" {
   }
 }
 
-# Project — groups resources together in the DO dashboard
+# Project: groups resources together in the DO dashboard
 resource "digitalocean_project" "main" {
   name       = var.project_name
   is_default = true

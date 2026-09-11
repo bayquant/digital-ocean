@@ -1,5 +1,5 @@
 # Copy this file to terraform.tfvars and fill in your values
-# Never commit terraform.tfvars — it contains secrets
+# Never commit terraform.tfvars: it contains secrets
 
 do_token            = "your_digitalocean_api_token_here"
 repo_url            = "https://github.com/your-username/your-repo.git"

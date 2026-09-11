@@ -40,7 +40,7 @@ variable "repo_url" {
 }
 
 variable "deploy_password" {
-  description = "Password for the deploy user — needed for sudo on the droplet (never commit this)"
+  description = "Password for the deploy user: needed for sudo on the droplet (never commit this)"
   type        = string
   sensitive   = true
 }
