@@ -17,7 +17,9 @@ resource "digitalocean_ssh_key" "default" {
   public_key = file(var.ssh_public_key_path)
 }
 
-# Firewall: only allow SSH and app port
+# Firewall: only allow SSH, HTTP and HTTPS
+# The app port is not opened: the app only listens on the droplet's loopback,
+# and Caddy forwards public traffic to it
 resource "digitalocean_firewall" "app" {
   name = "${var.app_name}-firewall"
 
@@ -31,7 +33,13 @@ resource "digitalocean_firewall" "app" {
 
   inbound_rule {
     protocol         = "tcp"
-    port_range       = tostring(var.app_port)
+    port_range       = "80"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "443"
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 
@@ -55,8 +63,11 @@ resource "digitalocean_project" "main" {
 }
 
 resource "digitalocean_project_resources" "main" {
-  project   = digitalocean_project.main.id
-  resources = [digitalocean_droplet.app.urn]
+  project = digitalocean_project.main.id
+  resources = [
+    digitalocean_droplet.app.urn,
+    digitalocean_domain.main.urn,
+  ]
 }
 
 # The droplet
@@ -72,5 +83,28 @@ resource "digitalocean_droplet" "app" {
     repo_url        = var.repo_url
     app_port        = var.app_port
     deploy_password = var.deploy_password
+    domain_name     = var.domain_name
   })
+}
+
+# DNS: DigitalOcean answers for the domain because the registrar's nameservers
+# point to ns1/ns2/ns3.digitalocean.com
+resource "digitalocean_domain" "main" {
+  name = var.domain_name
+}
+
+# Both records reference the droplet's IP, so recreating the droplet updates
+# DNS automatically
+resource "digitalocean_record" "root" {
+  domain = digitalocean_domain.main.id
+  type   = "A"
+  name   = "@"
+  value  = digitalocean_droplet.app.ipv4_address
+}
+
+resource "digitalocean_record" "www" {
+  domain = digitalocean_domain.main.id
+  type   = "A"
+  name   = "www"
+  value  = digitalocean_droplet.app.ipv4_address
 }

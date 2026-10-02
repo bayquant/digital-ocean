@@ -29,7 +29,7 @@ variable "size" {
 }
 
 variable "app_port" {
-  description = "Port the app listens on"
+  description = "Port the app listens on inside the container (only reachable from the droplet itself)"
   type        = number
   default     = 8000
 }
@@ -43,6 +43,11 @@ variable "deploy_password" {
   description = "Password for the deploy user: needed for sudo on the droplet (never commit this)"
   type        = string
   sensitive   = true
+}
+
+variable "domain_name" {
+  description = "Domain the app is served on, without www (e.g. example.com)"
+  type        = string
 }
 
 variable "project_name" {

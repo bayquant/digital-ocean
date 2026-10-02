@@ -9,3 +9,4 @@ region              = "nyc3"
 size                = "s-1vcpu-1gb"
 app_port            = 8000
 deploy_password     = "a-strong-password-for-sudo"
+domain_name         = "example.com"

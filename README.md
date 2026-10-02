@@ -1,6 +1,38 @@
 # Deploying a Python Web App to a DigitalOcean Droplet
 
-These steps assume a fresh Ubuntu droplet. They are split into two phases: hardening the server first, then deploying the app. Do not skip or reorder the hardening steps: some mistakes (like enabling a firewall before allowing SSH) will permanently lock you out.
+These steps assume a fresh Ubuntu droplet. They are split into three phases: hardening the server, deploying the app, then serving it on a domain over HTTPS. Do not skip or reorder the hardening steps: some mistakes (like enabling a firewall before allowing SSH) will permanently lock you out.
+
+The finished setup looks like this:
+
+```
+                      Visitor
+                         │ https://YOUR_DOMAIN
+                         ▼
+┌─────────────────────────────────────────────────┐
+│ DigitalOcean network                            │
+│   Cloud Firewall: only 22, 80, 443 get in       │
+└────────────────────────┬────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────┐
+│ Droplet                                         │
+│   UFW: only 22, 80, 443 get in                  │
+│                        │                        │
+│                        ▼                        │
+│              ┌───────────────────┐              │
+│              │ Caddy :80, :443   │              │
+│              │ terminates HTTPS  │              │
+│              └─────────┬─────────┘              │
+│                        │ 127.0.0.1:8000         │
+│                        ▼ loopback only          │
+│              ┌───────────────────┐              │
+│              │ app container     │              │
+│              │ uvicorn 0.0.0.0   │              │
+│              └───────────────────┘              │
+│                                                 │
+└─────────────────────────────────────────────────┘
+```
+
+Only ports 22, 80 and 443 are reachable from the internet. The app itself is never exposed directly: Caddy receives every request, handles HTTPS, and forwards it to the app over the droplet's internal loopback connection. [How traffic reaches the app](#how-traffic-reaches-the-app) explains each layer.
 
 ---
 
@@ -183,14 +215,17 @@ docker build -t myapp .
 - `-t myapp` gives the image a name so you can refer to it later
 - `.` tells Docker to look for the `Dockerfile` in the current directory
 
-### Step 12: Open the app's port in the firewall
+### Step 12: Open HTTP and HTTPS in the firewall
 
 ```bash
-sudo ufw allow YOUR_APP_PORT
+sudo ufw allow 80
+sudo ufw allow 443
 sudo ufw status
 ```
 
-Replace `YOUR_APP_PORT` with whichever port your app listens on (e.g. 8000). This must be done after enabling UFW (Step 3) so the rule is added to an already-active firewall.
+These are the ports Caddy will listen on in Phase 3: 443 serves the site over HTTPS, and 80 is used by Let's Encrypt to verify you control the domain and to redirect plain HTTP visitors to HTTPS. This must be done after enabling UFW (Step 3) so the rules are added to an already-active firewall.
+
+Do **not** open the app's port (e.g. 8000). The app only accepts connections from the droplet itself (see Step 13), and Caddy is the only thing that talks to it.
 
 ### Step 13: Create a systemd service
 
@@ -211,7 +246,7 @@ User=deploy
 Restart=on-failure
 ExecStartPre=-/usr/bin/docker stop myapp
 ExecStartPre=-/usr/bin/docker rm myapp
-ExecStart=/usr/bin/docker run --name myapp -p YOUR_APP_PORT:YOUR_APP_PORT myapp
+ExecStart=/usr/bin/docker run --name myapp -p 127.0.0.1:YOUR_APP_PORT:YOUR_APP_PORT myapp
 ExecStop=/usr/bin/docker stop myapp
 
 [Install]
@@ -226,6 +261,7 @@ WantedBy=multi-user.target
 - `ExecStartPre=-/usr/bin/docker stop myapp`: stops any leftover container from a previous run before starting a new one; the `-` prefix means systemd ignores this if the container doesn't exist yet
 - `ExecStartPre=-/usr/bin/docker rm myapp`: removes the stopped container so `docker run` can reuse the name
 - `--name myapp`: names the running container so `ExecStop` can reference it
+- `-p 127.0.0.1:YOUR_APP_PORT:YOUR_APP_PORT`: forwards the droplet's port into the container, but only on the loopback address `127.0.0.1`, so only programs on the droplet (Caddy) can connect. Without the `127.0.0.1:` prefix, Docker publishes the port on `0.0.0.0` (every network connection), and its own firewall rules bypass UFW: the app would be reachable from the internet even though UFW never allowed the port.
 - `Restart=on-failure`: restarts automatically if the process exits with an error
 - `WantedBy=multi-user.target`: registers the service to start on normal system boot
 
@@ -240,13 +276,159 @@ sudo systemctl status myapp         # confirm it is active and running
 
 `enable` and `start` are separate operations. `enable` alone does not start the service immediately. `start` alone does not persist across reboots. You need both.
 
-### Step 15: Verify the app is reachable
+### Step 15: Verify the app is running
 
 ```bash
-curl http://localhost:YOUR_APP_PORT
+curl http://127.0.0.1:YOUR_APP_PORT
 ```
 
-If the app responds, it is up and listening. Then test from outside by visiting `http://YOUR_DROPLET_IP:YOUR_APP_PORT` in a browser.
+If the app responds, it is up and listening. It is not reachable from outside yet, by design: Phase 3 puts it on your domain over HTTPS.
+
+---
+
+## Phase 3: Serve the app on a domain over HTTPS
+
+### Step 16: Buy a domain and point it to DigitalOcean
+
+DigitalOcean does not sell domains: buy one from a registrar (e.g. Porkbun, Namecheap). Use accurate contact details (ICANN requires them, and the registrar can suspend a domain with false ones) and make sure WHOIS privacy is on, so they are not public. Confirm the verification email the registrar sends, or the domain can be suspended.
+
+Then, in the registrar's dashboard, replace its nameservers with DigitalOcean's:
+
+```
+ns1.digitalocean.com
+ns2.digitalocean.com
+ns3.digitalocean.com
+```
+
+**What this does**
+Three roles are involved, and they are easy to confuse:
+
+| Role | What it does | Here |
+|---|---|---|
+| Registrar | Records that you own the name | Porkbun, Namecheap, ... |
+| DNS host | Answers "what IP is this domain?" | DigitalOcean (after this step) |
+| Server | Runs the website | Your droplet |
+
+Changing the nameservers tells the internet that DigitalOcean answers DNS questions for the domain, so the records you create in DigitalOcean (next step) take effect.
+
+> **Cloudflare Registrar** does not allow changing nameservers: DNS must stay on Cloudflare. If you buy there, create the records in Cloudflare instead, and set them to "DNS only" (grey cloud) so Cloudflare's proxy does not interfere with Caddy's certificate.
+
+### Step 17: Create the DNS records
+
+In the DigitalOcean dashboard: **Networking** → **Domains** → add `YOUR_DOMAIN` to your project, then create two **A** records directing to your droplet:
+
+| Type | Hostname | Points to |
+|---|---|---|
+| A | `@` | your droplet (the bare domain, `YOUR_DOMAIN`) |
+| A | `www` | your droplet (`www.YOUR_DOMAIN`) |
+
+DNS answers are cached across the internet, so changes take from a few minutes to a few hours to spread (a brand-new domain is usually fast). Check from your laptop:
+
+```bash
+dig +short NS YOUR_DOMAIN   # should list ns1/ns2/ns3.digitalocean.com
+dig +short YOUR_DOMAIN      # should print your droplet IP
+```
+
+Avoid testing in the browser before `dig` shows the right IP: your computer can cache the "not found" answer and keep showing an error after the domain works for everyone else.
+
+### Step 18: Allow HTTP and HTTPS in the DigitalOcean Cloud Firewall
+
+Skip this if your droplet has no Cloud Firewall attached. Otherwise: **Networking** → **Firewalls** → your firewall → **Inbound Rules** → add **HTTP** (80) and **HTTPS** (443). Remove any rule for the app's port.
+
+UFW (Step 12) and the Cloud Firewall are separate layers, and traffic must pass both. If you deploy with Terraform, change the firewall in `main.tf` instead: Terraform reverts manual dashboard changes on the next `apply`.
+
+### Step 19: Install Caddy
+
+```bash
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update
+sudo apt install -y caddy
+```
+
+Caddy is a web server used here as a **reverse proxy**: it stands in front of the app, receives every request on the standard web ports, forwards it to the app, and sends the reply back. It also handles HTTPS: it obtains a free certificate from Let's Encrypt (the "SSL certificate" that proves the server really is your domain) and renews it before it expires, with no configuration beyond naming the domain. Ubuntu 22.04 does not ship Caddy, so these commands add Caddy's official package repository first.
+
+Caddy is not a load balancer in this setup: a load balancer spreads requests across several copies of an app, while here every request goes to the one app container.
+
+### Step 20: Configure Caddy
+
+```bash
+sudo nano /etc/caddy/Caddyfile
+```
+
+Replace the whole file with:
+
+```
+YOUR_DOMAIN, www.YOUR_DOMAIN {
+    reverse_proxy 127.0.0.1:YOUR_APP_PORT
+}
+```
+
+Then apply it:
+
+```bash
+sudo systemctl reload caddy
+```
+
+- The first line lists the names Caddy answers for. Naming real domains is what makes Caddy fetch the HTTPS certificate.
+- `reverse_proxy 127.0.0.1:YOUR_APP_PORT` forwards every request to the app on the loopback address. Use `127.0.0.1`, not `localhost`: `localhost` can resolve to the IPv6 loopback `::1`, where Docker is not listening (Step 13 binds IPv4 only).
+
+### Step 21: Verify HTTPS
+
+Open `https://YOUR_DOMAIN` in a browser. The first visit can take a few seconds while Caddy obtains the certificate. If it fails:
+
+```bash
+sudo journalctl -u caddy -n 50   # Caddy's logs, including certificate errors
+```
+
+The most common cause is DNS not pointing at the droplet yet (Step 17) or port 80/443 blocked by one of the firewalls (Steps 12 and 18).
+
+---
+
+## How traffic reaches the app
+
+### Ports and firewalls
+
+Every service on a machine listens on a numbered **port**: 22 for SSH, 80 for HTTP, 443 for HTTPS, 8000 (or similar) for the app. Data travels in **packets**, each labeled with its source IP, destination IP, port and protocol (TCP for web and SSH). A **firewall** checks each incoming packet against its rules and drops anything not explicitly allowed (**default deny**).
+
+This setup has two firewalls, and a packet must pass both:
+
+| | DigitalOcean Cloud Firewall | UFW |
+|---|---|---|
+| Runs | In DigitalOcean's network, before traffic reaches the droplet | On the droplet, in front of Linux's built-in packet filter |
+| Managed from | Dashboard or Terraform (`main.tf`) | `ufw` commands on the droplet |
+| Can the droplet change it? | No: a compromised droplet cannot open ports here | Yes |
+
+Both firewalls are **stateful**: rules only control who may *start* a connection, and replies to an allowed connection are let through automatically. That is why outbound responses to visitors need no rule, and why the droplet's own requests (`apt`, `git clone`, Let's Encrypt) get their replies back.
+
+Traffic between programs on the same droplet (Caddy to the app) uses the internal **loopback** connection. It never leaves the machine, so neither firewall applies to it.
+
+### Docker bypasses UFW
+
+`docker run -p` writes its own low-level firewall rules for published ports, and they are checked before UFW's. A port published on `0.0.0.0` is therefore reachable from the internet even if `ufw status` shows it closed. Two defenses apply here: the app is published on `127.0.0.1` only (Step 13), and the Cloud Firewall, which sits outside the droplet and is unaffected by Docker, does not allow the app's port.
+
+### What `0.0.0.0`, `127.0.0.1` and `localhost` mean
+
+The same digits mean different things depending on where they appear:
+
+| Where | Value | Meaning |
+|---|---|---|
+| A server's listen address | `0.0.0.0` | Accept connections on every network connection the machine has, including the public one |
+| A server's listen address | `127.0.0.1` | Accept connections only from the same machine |
+| A firewall rule's source | `0.0.0.0/0`, `::/0` | Any IPv4 / IPv6 address on the internet (CIDR notation: `/0` matches everything, `/32` exactly one IPv4 address) |
+| A destination to connect to | `localhost` | A name for the same machine, usually `127.0.0.1` and sometimes the IPv6 loopback `::1` |
+
+Applied to this setup:
+
+- **Inside the container, the app listens on `0.0.0.0`** (e.g. `uvicorn --host 0.0.0.0` in the app's Dockerfile). This is required, not a risk: a container has its own network and its own `127.0.0.1`. Docker delivers forwarded traffic through the container's network connection, so an app listening on the container's `127.0.0.1` would refuse everything, Caddy included.
+- **On the droplet, the port is published on `127.0.0.1`** (`-p 127.0.0.1:8000:8000`). This is where access is restricted. Rule of thumb: inside a container, always listen on `0.0.0.0`; decide who can reach it with `-p`.
+- **Firewall rules for 80 and 443 use `0.0.0.0/0`**, because the site is public. A rule allowing only `127.0.0.1` would match nothing: loopback traffic never crosses the Cloud Firewall.
+- **SSH (22) could be narrowed** to your own IP (e.g. `["203.0.113.5/32"]`), at the cost of a lockout whenever your home IP changes. Key-only login (Step 6) already makes brute-forcing it infeasible, so it is left open to all.
+
+### Why `.dev` domains only work over HTTPS
+
+Browsers ship with a built-in **HSTS preload list** of domains that must only ever be loaded over HTTPS. Google, which runs the `.dev` ending, preloaded the entire ending (as with `.app` and `.page`), so browsers silently rewrite `http://` to `https://` for every `.dev` site. Without Caddy (or another HTTPS setup) such a site cannot be opened in a browser at all, even on a plain-HTTP port like `:8000`. Tools like `curl` do not use the preload list, so `curl http://...` still works for testing.
 
 ---
 
@@ -295,7 +477,7 @@ If you don't have Homebrew: install it from [brew.sh](https://brew.sh), then run
 ### What each file is for
 
 ```
-├── main.tf                   # The infrastructure definition: droplet, firewall, SSH key
+├── main.tf                   # The infrastructure definition: droplet, firewall, SSH key, DNS
 ├── variables.tf              # Declares all input variables and their types/defaults
 ├── outputs.tf                # What Terraform prints after apply (IP address, app URL)
 ├── user_data.sh              # Bootstrap script that runs once on first boot
@@ -304,10 +486,10 @@ If you don't have Homebrew: install it from [brew.sh](https://brew.sh), then run
 └── .gitignore                # Excludes tfvars, state files, and the .terraform directory
 ```
 
-- **`main.tf`** is the core. It describes what resources to create on DigitalOcean: the droplet, the firewall rules, and the SSH key. Terraform reads this and figures out what API calls to make.
+- **`main.tf`** is the core. It describes what resources to create on DigitalOcean: the droplet, the firewall rules, the SSH key, and the domain with its DNS records. Terraform reads this and figures out what API calls to make. The DNS records reference the droplet's IP, so whenever the droplet is recreated, DNS follows it automatically.
 - **`variables.tf`** lists every input the scripts accept (token, repo URL, port, etc.) without storing any values. It's the contract: `main.tf` references these, and you supply the actual values in `terraform.tfvars`.
-- **`outputs.tf`** tells Terraform what to print when provisioning is done: in this case the droplet's IP address and the app URL so you don't have to look them up manually.
-- **`user_data.sh`** is a shell script that DigitalOcean runs automatically on the droplet the first time it boots. It handles everything in the manual guide: installing software, creating users, hardening SSH, and starting the app as a service.
+- **`outputs.tf`** tells Terraform what to print when provisioning is done: in this case the droplet's IP address and the app's `https://` URL so you don't have to look them up manually.
+- **`user_data.sh`** is a shell script that DigitalOcean runs automatically on the droplet the first time it boots. It handles everything in the manual guide: installing software, creating users, hardening SSH, starting the app as a service, and setting up Caddy for HTTPS. Terraform fills in its `${...}` placeholders (repo URL, port, password, domain) with `templatefile` before sending it to DigitalOcean. Because it only runs on first boot, any change to it (or to those variables) makes Terraform destroy and recreate the droplet.
 - **`terraform.tfvars.example`** is a committed template that shows what variables need values. It contains no real secrets: just placeholders. Copy it to `terraform.tfvars` and fill it in.
 - **`terraform.tfvars`** is your personal copy with real values: your API token, passwords, and repo URL. It is excluded from git and must never be committed.
 
@@ -339,7 +521,10 @@ The bootstrap script (`user_data.sh`) runs once on first boot and handles:
 - Creating the `deploy` sudo user and copying your SSH key to them
 - Disabling root SSH login and password authentication
 - Cloning the repo and building the Docker image
-- Starting the app as a systemd service running as `deploy`
+- Starting the app as a systemd service running as `deploy`, published on `127.0.0.1` only
+- Installing Caddy and configuring it to serve the domain over HTTPS
+
+Terraform itself handles the Cloud Firewall (22, 80 and 443 only) and the DNS records. Buying the domain and pointing its nameservers to DigitalOcean (Step 16) is the one part you do by hand at the registrar.
 
 ### Generating a DigitalOcean API token
 
@@ -352,6 +537,8 @@ Select the following scopes:
 | `droplet` | Create, Read, Update, Delete |
 | `firewall` | Create, Read, Update, Delete |
 | `ssh_key` | Create, Read, Update, Delete |
+| `domain` | Create, Read, Update, Delete |
+| `project` | Create, Read, Update, Delete |
 | `regions` | Read |
 | `sizes` | Read |
 | `image` | Read |
@@ -378,6 +565,27 @@ Open `terraform.tfvars` and fill in all values. The required ones:
 | `repo_url` | HTTPS URL of your GitHub repo (must contain a Dockerfile) |
 | `deploy_password` | Password for the `deploy` user (used for sudo) |
 | `app_port` | Port your app listens on inside the container |
+| `domain_name` | Your domain without `www` (e.g. `example.com`), with nameservers already pointed to DigitalOcean (Step 16) |
+
+The repo must be **public**: the droplet clones it over HTTPS without credentials, and for a private (or misspelled) repo GitHub asks for a username, which fails the unattended boot script with `could not read Username for 'https://github.com'`.
+
+### Moving an existing domain into Terraform (one-time)
+
+Skip this if the domain is not yet in your DigitalOcean account: `terraform apply` creates it. If you already added it in the dashboard (Step 17), Terraform does not know it exists and `apply` fails trying to create it again. Import it, and its two A records, into Terraform's state first:
+
+```bash
+terraform init
+terraform import digitalocean_domain.main YOUR_DOMAIN
+
+# Find the IDs of the @ and www A records
+curl -s -H "Authorization: Bearer YOUR_DO_TOKEN" \
+    "https://api.digitalocean.com/v2/domains/YOUR_DOMAIN/records?type=A"
+
+terraform import digitalocean_record.root YOUR_DOMAIN,ID_OF_THE_@_RECORD
+terraform import digitalocean_record.www YOUR_DOMAIN,ID_OF_THE_WWW_RECORD
+```
+
+In the `curl` output, each record has an `"id"` and a `"name"` (`"@"` or `"www"`). Import only changes Terraform's state file: nothing on DigitalOcean is modified. Afterwards, `terraform plan` shows how the live setup differs from the code.
 
 ### Apply
 
@@ -392,7 +600,7 @@ terraform plan
 terraform apply
 ```
 
-After `apply`, Terraform prints the droplet IP and app URL. The bootstrap script runs in the background: wait about 2 minutes for it to complete before testing.
+After `apply`, Terraform prints the droplet IP and app URL. The bootstrap script runs in the background: wait about 3 to 5 minutes for it to complete before testing. If the droplet was recreated, its IP changed: Terraform updates the DNS records, but caches across the internet may serve the old IP for a while.
 
 ### Verify
 
@@ -400,9 +608,17 @@ After `apply`, Terraform prints the droplet IP and app URL. The bootstrap script
 # Confirm you can log in as deploy (not root)
 ssh deploy@YOUR_DROPLET_IP
 
-# Check the app is running
-curl http://YOUR_DROPLET_IP:YOUR_APP_PORT
+# On the droplet: did the bootstrap script finish without errors?
+cloud-init status --long
+sudo tail -n 40 /var/log/cloud-init-output.log   # the error is usually at the bottom
+
+# On the droplet: is the app running?
+curl http://127.0.0.1:YOUR_APP_PORT
 ```
+
+Then open `https://YOUR_DOMAIN` in a browser.
+
+The boot script stops at the first failing command (`set -euo pipefail`), so everything after a failure is skipped. The rendered script, with all variables filled in, is at `/var/lib/cloud/instance/user-data.txt`. It is readable by root only because it contains `deploy_password` in plain text (which is also stored in `terraform.tfstate`).
 
 ### Tear down
 
@@ -416,7 +632,11 @@ terraform destroy
 
 | Problem | Fix |
 |---|---|
-| App starts but isn't reachable | Check `sudo ufw status`: the port may not be open |
+| Site isn't reachable | Check `dig +short YOUR_DOMAIN` returns the droplet IP, ports 80/443 are open in both firewalls, and `sudo journalctl -u caddy -n 50` |
+| Browser fails on `http://YOUR_DOMAIN:8000` | Expected: the app port is private, and `.dev`/`.app` domains are HTTPS-only in browsers. Use `https://YOUR_DOMAIN` |
+| `/opt/myapp` missing on the droplet | The boot script failed before cloning: check `/var/log/cloud-init-output.log` |
+| `could not read Username for 'https://github.com'` | The repo is private or `repo_url` is wrong: see [Setup](#setup) |
+| `terraform apply` fails creating the domain | It already exists in DigitalOcean: [import it](#moving-an-existing-domain-into-terraform-one-time) |
 | Container exits immediately | `docker logs myapp` to see the error from inside the container |
 | `docker build` fails | Confirm a `Dockerfile` exists in the repo root and the build succeeds locally first |
 | Port already in use | `sudo fuser -k YOUR_APP_PORT/tcp` |

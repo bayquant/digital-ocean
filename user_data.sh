@@ -80,10 +80,13 @@ chown -R deploy:deploy /opt/myapp
 docker build -t myapp /opt/myapp
 
 # -----------------------------------------------------------------------------
-# Step 10: Open the app port in UFW
-# Done after enabling UFW so the rule is added to an active firewall
+# Step 10: Open HTTP and HTTPS in UFW
+# Done after enabling UFW so the rules are added to an active firewall.
+# Caddy (Step 13) listens on both: 80 for Let's Encrypt's domain check and the
+# redirect to HTTPS, 443 for the site itself. The app port is not opened.
 # -----------------------------------------------------------------------------
-ufw allow ${app_port}
+ufw allow 80
+ufw allow 443
 
 # -----------------------------------------------------------------------------
 # Step 11: Create systemd service
@@ -91,6 +94,10 @@ ufw allow ${app_port}
 # ExecStartPre cleans up any leftover container from a previous run:
 # the leading - means systemd ignores failure if no container exists yet.
 # Requires=docker.service ensures the Docker daemon is running first.
+# -p 127.0.0.1:... publishes the port on the droplet's loopback only, so only
+# programs on the droplet (Caddy) can reach the app. Docker writes its own
+# firewall rules that bypass UFW, so binding to loopback is what actually
+# keeps the port private.
 # -----------------------------------------------------------------------------
 cat > /etc/systemd/system/myapp.service << 'SYSTEMD_EOF'
 [Unit]
@@ -103,7 +110,7 @@ User=deploy
 Restart=on-failure
 ExecStartPre=-/usr/bin/docker stop myapp
 ExecStartPre=-/usr/bin/docker rm myapp
-ExecStart=/usr/bin/docker run --name myapp -p ${app_port}:${app_port} myapp
+ExecStart=/usr/bin/docker run --name myapp -p 127.0.0.1:${app_port}:${app_port} myapp
 ExecStop=/usr/bin/docker stop myapp
 
 [Install]
@@ -118,3 +125,27 @@ SYSTEMD_EOF
 systemctl daemon-reload
 systemctl enable myapp
 systemctl start myapp
+
+# -----------------------------------------------------------------------------
+# Step 13: Install Caddy and serve the app over HTTPS
+# Caddy is a reverse proxy: it receives public traffic on 80/443 and forwards
+# it to the app on the droplet's loopback. Naming the domains in the Caddyfile
+# makes Caddy obtain and renew a Let's Encrypt certificate automatically.
+# If DNS does not point at this droplet yet, Caddy keeps retrying on its own.
+# Installed from Caddy's official apt repository (Ubuntu 22.04 has no package).
+# -----------------------------------------------------------------------------
+apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    > /etc/apt/sources.list.d/caddy-stable.list
+apt-get update -y
+apt-get install -y caddy
+
+cat > /etc/caddy/Caddyfile << 'CADDY_EOF'
+${domain_name}, www.${domain_name} {
+    reverse_proxy 127.0.0.1:${app_port}
+}
+CADDY_EOF
+
+systemctl reload caddy
