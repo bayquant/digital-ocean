@@ -635,6 +635,7 @@ The app's `.caddy` file is what names its domains: `domain_name` in Terraform on
 
 ```bash
 terraform destroy
+terraform destroy -target=digitalocean_droplet.host   # keeps the project: a full destroy errors on the default project
 ```
 
 ---
