@@ -87,15 +87,18 @@ ufw allow 443
 # Caddy is a reverse proxy: it receives public traffic on 80/443 and forwards
 # it to the apps on the droplet's loopback. It obtains and renews Let's Encrypt
 # certificates automatically for every domain named in a site block.
-# Installed from Caddy's official apt repository (Ubuntu 22.04 has no package).
+# Installed from the .deb that Caddy publishes on GitHub releases, pinned to a
+# version: Ubuntu 22.04 has no package, and Caddy's apt repository on
+# Cloudsmith has returned "402 Payment Required" (a quota on their side),
+# which aborted this script. The .deb includes the systemd service and the
+# caddy user, exactly like the apt package.
 # -----------------------------------------------------------------------------
-apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-    > /etc/apt/sources.list.d/caddy-stable.list
-apt-get update -y
-apt-get install -y caddy
+caddy_version=2.11.7
+caddy_deb="caddy_$${caddy_version}_linux_$(dpkg --print-architecture).deb"
+curl -fsSL -o "/tmp/$caddy_deb" \
+    "https://github.com/caddyserver/caddy/releases/download/v$caddy_version/$caddy_deb"
+apt-get install -y "/tmp/$caddy_deb"
+rm -f "/tmp/$caddy_deb"
 
 # -----------------------------------------------------------------------------
 # Step 10: Let each app add its own site to Caddy

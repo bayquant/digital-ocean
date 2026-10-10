@@ -209,14 +209,13 @@ Do **not** open any app's port (e.g. 8000). Apps only accept connections from th
 ### Step 11: Install Caddy
 
 ```bash
-sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-sudo apt update
-sudo apt install -y caddy
+CADDY_VERSION=2.11.7
+curl -fsSLO "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_$(dpkg --print-architecture).deb"
+sudo apt install -y "./caddy_${CADDY_VERSION}_linux_$(dpkg --print-architecture).deb"
+rm "caddy_${CADDY_VERSION}_linux_$(dpkg --print-architecture).deb"
 ```
 
-Caddy is a web server used here as a **reverse proxy**: it stands in front of the apps, receives every request on the standard web ports, forwards it to the right app, and sends the reply back. It also handles HTTPS: it obtains a free certificate from Let's Encrypt (the "SSL certificate" that proves the server really is your domain) and renews it before it expires, with no configuration beyond naming the domain. Ubuntu 22.04 does not ship Caddy, so these commands add Caddy's official package repository first.
+Caddy is a web server used here as a **reverse proxy**: it stands in front of the apps, receives every request on the standard web ports, forwards it to the right app, and sends the reply back. It also handles HTTPS: it obtains a free certificate from Let's Encrypt (the "SSL certificate" that proves the server really is your domain) and renews it before it expires, with no configuration beyond naming the domain. Ubuntu 22.04 does not ship Caddy, so these commands install the `.deb` that Caddy publishes on its GitHub releases page (it includes the systemd service and a `caddy` user, exactly like the apt package). The version is pinned: check the [releases page](https://github.com/caddyserver/caddy/releases) for a newer one when you rebuild. Caddy's own apt repository is deliberately not used: it has returned `402 Payment Required` (a download quota on the hosting service's side), which breaks `apt update` for the whole machine.
 
 Caddy is not a load balancer in this setup: a load balancer spreads requests across several copies of an app, while here each domain goes to the one container that serves it.
 
@@ -594,7 +593,9 @@ The droplet has no app on it yet: deploy one as described in [Adding an app](#ad
 # Confirm you can log in as deploy (not root)
 ssh deploy@YOUR_DROPLET_IP
 
-# On the droplet: did the bootstrap script finish without errors?
+# On the droplet: wait for the bootstrap script, then check it finished without errors
+# (until it reaches Step 4, the login above fails with "Permission denied (publickey)": retry in a minute)
+cloud-init status --wait    # expect "status: done"
 cloud-init status --long
 sudo tail -n 40 /var/log/cloud-init-output.log   # the error is usually at the bottom
 
