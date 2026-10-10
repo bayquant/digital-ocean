@@ -10,10 +10,10 @@ variable "ssh_public_key_path" {
   default     = "~/.ssh/id_ed25519.pub"
 }
 
-variable "app_name" {
+variable "host_name" {
   description = "Name for the droplet and firewall"
   type        = string
-  default     = "fastapi-app"
+  default     = "host"
 }
 
 variable "region" {
@@ -28,17 +28,6 @@ variable "size" {
   default     = "s-1vcpu-1gb"
 }
 
-variable "app_port" {
-  description = "Port the app listens on inside the container (only reachable from the droplet itself)"
-  type        = number
-  default     = 8000
-}
-
-variable "repo_url" {
-  description = "HTTPS URL of your GitHub repo to clone on the droplet"
-  type        = string
-}
-
 variable "deploy_password" {
   description = "Password for the deploy user: needed for sudo on the droplet (never commit this)"
   type        = string
@@ -46,7 +35,7 @@ variable "deploy_password" {
 }
 
 variable "domain_name" {
-  description = "Domain the app is served on, without www (e.g. example.com)"
+  description = "Domain whose DNS zone Terraform manages, without www (e.g. example.com); its @ and www records point at the droplet"
   type        = string
 }
 

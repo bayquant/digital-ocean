@@ -1,6 +1,6 @@
-# Deploying a Python Web App to a DigitalOcean Droplet
+# Hosting Web Apps on a DigitalOcean Droplet
 
-These steps assume a fresh Ubuntu droplet. They are split into three phases: hardening the server, deploying the app, then serving it on a domain over HTTPS. Do not skip or reorder the hardening steps: some mistakes (like enabling a firewall before allowing SSH) will permanently lock you out.
+These steps assume a fresh Ubuntu droplet. They are split into three phases: hardening the server, preparing it to host apps (Docker and Caddy), then deploying an app on a domain over HTTPS. Phases 1 and 2 are done once per droplet. Phase 3 is repeated for each app, and never touches the host setup again. Do not skip or reorder the hardening steps: some mistakes (like enabling a firewall before allowing SSH) will permanently lock you out.
 
 The finished setup looks like this:
 
@@ -22,17 +22,17 @@ The finished setup looks like this:
 │              │ Caddy :80, :443   │              │
 │              │ terminates HTTPS  │              │
 │              └─────────┬─────────┘              │
-│                        │ 127.0.0.1:8000         │
+│                        │ 127.0.0.1:PORT         │
 │                        ▼ loopback only          │
 │              ┌───────────────────┐              │
 │              │ app container     │              │
-│              │ uvicorn 0.0.0.0   │              │
+│              │ /opt/apps/NAME    │              │
 │              └───────────────────┘              │
 │                                                 │
 └─────────────────────────────────────────────────┘
 ```
 
-Only ports 22, 80 and 443 are reachable from the internet. The app itself is never exposed directly: Caddy receives every request, handles HTTPS, and forwards it to the app over the droplet's internal loopback connection. [How traffic reaches the app](#how-traffic-reaches-the-app) explains each layer.
+Only ports 22, 80 and 443 are reachable from the internet. The apps themselves are never exposed directly: Caddy receives every request, handles HTTPS, and forwards it to the right app over the droplet's internal loopback connection. Each app is its own container with its own port, and registers its own domain with Caddy when it is deployed. [How traffic reaches the app](#how-traffic-reaches-the-app) explains each layer.
 
 ---
 
@@ -170,9 +170,9 @@ Do not close the root session until this works. If you close root first and the 
 
 ---
 
-## Phase 2: Deploy the app
+## Phase 2: Prepare the host for apps (one-time setup)
 
-From here, SSH in as `deploy` and prefix privileged commands with `sudo`.
+From here, SSH in as `deploy` and prefix privileged commands with `sudo`. Nothing in this phase is specific to one app: afterwards the droplet can host any number of Docker apps, each deployed in Phase 3.
 
 ### Step 8: Install Git
 
@@ -181,7 +181,7 @@ sudo apt install -y git
 git --version   # confirm it installed
 ```
 
-Git is not always present on a minimal droplet image. You need it to clone your repo and pull updates later.
+Git is not always present on a minimal droplet image. It is handy for working on the droplet directly. The deploy flow in Phase 3 sends code over SSH and does not need it.
 
 ### Step 9: Install Docker
 
@@ -190,32 +190,11 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker deploy
 ```
 
-Docker packages your app and all its dependencies into a self-contained image that runs the same way on any machine. The official convenience script (`get.docker.com`) installs Docker's latest stable release from Docker's own package repository.
+Docker packages your app and all its dependencies into a self-contained image that runs the same way on any machine. The official convenience script (`get.docker.com`) installs Docker's latest stable release from Docker's own package repository, including the `docker compose` plugin that Phase 3 uses.
 
-`usermod -aG docker deploy` adds `deploy` to the `docker` group. By default, only root can run Docker commands. The `docker` group is a way to grant that ability to a normal user without giving them full sudo. This matters because the systemd service in Step 13 will run as `deploy`: it needs to be in the docker group to start and stop containers.
+`usermod -aG docker deploy` adds `deploy` to the `docker` group. By default, only root can run Docker commands. The `docker` group is a way to grant that ability to a normal user without giving them full sudo. This matters because deploys run `docker compose` as `deploy`.
 
-### Step 10: Clone the repository
-
-```bash
-sudo git clone YOUR_REPO_URL /opt/myapp
-sudo chown -R deploy:deploy /opt/myapp
-```
-
-`/opt` is the conventional location for third-party applications on Linux. The repo is owned by `deploy` (rather than root) because `deploy` will be the one building the image and managing the container.
-
-### Step 11: Build the Docker image
-
-```bash
-cd /opt/myapp
-docker build -t myapp .
-```
-
-`docker build` reads the `Dockerfile` in your repo and produces a local image. It installs your app's dependencies inside the image so the server doesn't need a language runtime, a virtual environment, or any of your app's packages installed directly: everything is bundled inside the image.
-
-- `-t myapp` gives the image a name so you can refer to it later
-- `.` tells Docker to look for the `Dockerfile` in the current directory
-
-### Step 12: Open HTTP and HTTPS in the firewall
+### Step 10: Open HTTP and HTTPS in the firewall
 
 ```bash
 sudo ufw allow 80
@@ -223,70 +202,117 @@ sudo ufw allow 443
 sudo ufw status
 ```
 
-These are the ports Caddy will listen on in Phase 3: 443 serves the site over HTTPS, and 80 is used by Let's Encrypt to verify you control the domain and to redirect plain HTTP visitors to HTTPS. This must be done after enabling UFW (Step 3) so the rules are added to an already-active firewall.
+These are the ports Caddy will listen on: 443 serves your sites over HTTPS, and 80 is used by Let's Encrypt to verify you control each domain and to redirect plain HTTP visitors to HTTPS. This must be done after enabling UFW (Step 3) so the rules are added to an already-active firewall.
 
-Do **not** open the app's port (e.g. 8000). The app only accepts connections from the droplet itself (see Step 13), and Caddy is the only thing that talks to it.
+Do **not** open any app's port (e.g. 8000). Apps only accept connections from the droplet itself (see Step 14), and Caddy is the only thing that talks to them.
 
-### Step 13: Create a systemd service
-
-```bash
-sudo nano /etc/systemd/system/myapp.service
-```
-
-Paste the following, replacing `YOUR_APP_PORT`:
-
-```ini
-[Unit]
-Description=My app
-After=network.target docker.service
-Requires=docker.service
-
-[Service]
-User=deploy
-Restart=on-failure
-ExecStartPre=-/usr/bin/docker stop myapp
-ExecStartPre=-/usr/bin/docker rm myapp
-ExecStart=/usr/bin/docker run --name myapp -p 127.0.0.1:YOUR_APP_PORT:YOUR_APP_PORT myapp
-ExecStop=/usr/bin/docker stop myapp
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`systemd` is the Linux-native service manager: the right tool for keeping a process running persistently. Do not use `screen` or `nohup`: they don't survive reboots and don't restart the app on crash.
-
-- `Requires=docker.service`: the container can't run without the Docker daemon; this tells systemd to start Docker first and stop this service if Docker stops
-- `After=network.target docker.service`: waits for both networking and Docker to be ready before starting
-- `User=deploy`: runs as `deploy` (who is in the docker group), not root
-- `ExecStartPre=-/usr/bin/docker stop myapp`: stops any leftover container from a previous run before starting a new one; the `-` prefix means systemd ignores this if the container doesn't exist yet
-- `ExecStartPre=-/usr/bin/docker rm myapp`: removes the stopped container so `docker run` can reuse the name
-- `--name myapp`: names the running container so `ExecStop` can reference it
-- `-p 127.0.0.1:YOUR_APP_PORT:YOUR_APP_PORT`: forwards the droplet's port into the container, but only on the loopback address `127.0.0.1`, so only programs on the droplet (Caddy) can connect. Without the `127.0.0.1:` prefix, Docker publishes the port on `0.0.0.0` (every network connection), and its own firewall rules bypass UFW: the app would be reachable from the internet even though UFW never allowed the port.
-- `Restart=on-failure`: restarts automatically if the process exits with an error
-- `WantedBy=multi-user.target`: registers the service to start on normal system boot
-
-### Step 14: Enable and start the service
+### Step 11: Install Caddy
 
 ```bash
-sudo systemctl daemon-reload        # tells systemd to read the new unit file
-sudo systemctl enable myapp         # registers it to start automatically on boot
-sudo systemctl start myapp          # starts it right now, without rebooting
-sudo systemctl status myapp         # confirm it is active and running
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update
+sudo apt install -y caddy
 ```
 
-`enable` and `start` are separate operations. `enable` alone does not start the service immediately. `start` alone does not persist across reboots. You need both.
+Caddy is a web server used here as a **reverse proxy**: it stands in front of the apps, receives every request on the standard web ports, forwards it to the right app, and sends the reply back. It also handles HTTPS: it obtains a free certificate from Let's Encrypt (the "SSL certificate" that proves the server really is your domain) and renews it before it expires, with no configuration beyond naming the domain. Ubuntu 22.04 does not ship Caddy, so these commands add Caddy's official package repository first.
 
-### Step 15: Verify the app is running
+Caddy is not a load balancer in this setup: a load balancer spreads requests across several copies of an app, while here each domain goes to the one container that serves it.
+
+### Step 12: Let each app add its own site to Caddy
 
 ```bash
-curl http://127.0.0.1:YOUR_APP_PORT
+sudo mkdir -p /etc/caddy/conf.d
+sudo chown deploy:deploy /etc/caddy/conf.d
+echo 'import /etc/caddy/conf.d/*.caddy' | sudo tee /etc/caddy/Caddyfile
+sudo systemctl reload caddy
 ```
 
-If the app responds, it is up and listening. It is not reachable from outside yet, by design: Phase 3 puts it on your domain over HTTPS.
+The whole main Caddyfile becomes one line. `import` means "load every file in that folder whose name ends in `.caddy`, as if its contents were pasted here". Each app drops its own file in `conf.d` when it is deployed (Step 14), so apps never edit a shared file and cannot break each other's configuration.
+
+- The folder is owned by `deploy`, so writing a snippet needs no `sudo`.
+- With no snippets yet, Caddy logs a warning (`No files matching import glob pattern`) and serves nothing. That is the correct state at this point.
+- If a snippet has a syntax error, `reload` fails and Caddy keeps running the old working configuration.
+
+### Step 13: Create the apps directory and allow Caddy reloads
+
+```bash
+sudo mkdir -p /opt/apps
+sudo chown deploy:deploy /opt/apps
+
+echo 'deploy ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy' | sudo tee /etc/sudoers.d/deploy-caddy
+sudo chmod 440 /etc/sudoers.d/deploy-caddy
+sudo visudo -cf /etc/sudoers.d/deploy-caddy
+```
+
+`/opt` is the conventional location for third-party applications on Linux, and each app gets its own subdirectory: `/opt/apps/YOUR_APP`. The directory is owned by `deploy` because `deploy` is the one that places code there and manages the containers.
+
+A deploy runs non-interactively over SSH, so a `sudo` password prompt would hang it. The sudoers rule lets `deploy` run exactly one command without a password: reloading Caddy. Everything else still asks for the password. `visudo -cf` checks the syntax, because a typo in a sudoers file can break `sudo` entirely.
 
 ---
 
-## Phase 3: Serve the app on a domain over HTTPS
+## Phase 3: Deploy an app (repeat for each app)
+
+The host is ready. Every app brings its own deployment files, and the host setup above is never edited per app. Steps 16 to 18 (domain, DNS, Cloud Firewall) are done once per domain: if you do not have one yet, do them before filling in the app's Caddy snippet. By convention each app repo has a `deploy/` folder:
+
+```
+YOUR_APP/
+  deploy/
+    compose.yaml      # how the app runs
+    YOUR_APP.caddy    # which domain(s) Caddy serves it on
+    deploy.sh         # ships the code and runs the steps below
+```
+
+### Step 14: Write the app's deploy files
+
+`deploy/compose.yaml` describes how the app runs:
+
+```yaml
+name: YOUR_APP
+
+services:
+  YOUR_APP:
+    container_name: YOUR_APP
+    build: ..
+    ports:
+      - "127.0.0.1:YOUR_APP_PORT:YOUR_APP_PORT"
+    restart: unless-stopped
+```
+
+`deploy/YOUR_APP.caddy` is the site block Caddy loads from `conf.d`:
+
+```
+YOUR_DOMAIN, www.YOUR_DOMAIN {
+    reverse_proxy 127.0.0.1:YOUR_APP_PORT
+}
+```
+
+- `build: ..` builds the image from the `Dockerfile` in the repo root (the compose file sits one level down, in `deploy/`). It installs your app's dependencies inside the image so the server needs no language runtime or packages of its own.
+- `127.0.0.1:YOUR_APP_PORT:YOUR_APP_PORT` forwards the droplet's port into the container, but only on the loopback address `127.0.0.1`, so only programs on the droplet (Caddy) can connect. Without the `127.0.0.1:` prefix, Docker publishes the port on `0.0.0.0` (every network connection), and its own firewall rules bypass UFW: the app would be reachable from the internet even though UFW never allowed the port.
+- `restart: unless-stopped` brings the container back after a crash or a reboot. Docker itself starts at boot, so no systemd unit is needed per app. Do not use `screen` or `nohup`: they don't survive reboots and don't restart the app on crash.
+- Give every app on the droplet its own port (8000, 8001, ...).
+- The first line of the snippet lists the names Caddy answers for. Naming real domains is what makes Caddy fetch the HTTPS certificate.
+- `reverse_proxy 127.0.0.1:YOUR_APP_PORT` forwards every request to the app on the loopback address. Use `127.0.0.1`, not `localhost`: `localhost` can resolve to the IPv6 loopback `::1`, where Docker is not listening (the port above is published on IPv4 only).
+
+### Step 15: Deploy and verify
+
+From the app's repo on your laptop, send the committed code to the droplet and start it:
+
+```bash
+git archive --format=tar HEAD | ssh deploy@YOUR_DROPLET_IP "rm -rf /opt/apps/YOUR_APP && mkdir -p /opt/apps/YOUR_APP && tar -x -C /opt/apps/YOUR_APP"
+
+ssh deploy@YOUR_DROPLET_IP
+cd /opt/apps/YOUR_APP
+docker compose -f deploy/compose.yaml up -d --build
+cp deploy/YOUR_APP.caddy /etc/caddy/conf.d/YOUR_APP.caddy
+sudo systemctl reload caddy
+curl http://127.0.0.1:YOUR_APP_PORT
+```
+
+`git archive` runs on your laptop and packs the files of the latest commit (`HEAD`) into a tarball, which the droplet unpacks. Uncommitted changes are not deployed. The droplet needs no access to your repository, so it works for private repos too.
+
+If the app responds on the loopback address, it is up. It is not reachable from outside until DNS points at the droplet (Step 17). The `deploy.sh` in each app repo performs exactly the commands above in one go (see [Adding an app](#adding-an-app)).
 
 ### Step 16: Buy a domain and point it to DigitalOcean
 
@@ -315,7 +341,7 @@ Changing the nameservers tells the internet that DigitalOcean answers DNS questi
 
 ### Step 17: Create the DNS records
 
-In the DigitalOcean dashboard: **Networking** → **Domains** → add `YOUR_DOMAIN` to your project, then create two **A** records directing to your droplet:
+In the DigitalOcean dashboard: **Networking** → **Domains** → add `YOUR_DOMAIN` to your project, then create two **A** records directing to your droplet (one domain can serve several apps: add a record per extra subdomain):
 
 | Type | Hostname | Points to |
 |---|---|---|
@@ -335,46 +361,9 @@ Avoid testing in the browser before `dig` shows the right IP: your computer can 
 
 Skip this if your droplet has no Cloud Firewall attached. Otherwise: **Networking** → **Firewalls** → your firewall → **Inbound Rules** → add **HTTP** (80) and **HTTPS** (443). Remove any rule for the app's port.
 
-UFW (Step 12) and the Cloud Firewall are separate layers, and traffic must pass both. If you deploy with Terraform, change the firewall in `main.tf` instead: Terraform reverts manual dashboard changes on the next `apply`.
+UFW (Step 10) and the Cloud Firewall are separate layers, and traffic must pass both. If you deploy with Terraform, change the firewall in `main.tf` instead: Terraform reverts manual dashboard changes on the next `apply`.
 
-### Step 19: Install Caddy
-
-```bash
-sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
-sudo apt update
-sudo apt install -y caddy
-```
-
-Caddy is a web server used here as a **reverse proxy**: it stands in front of the app, receives every request on the standard web ports, forwards it to the app, and sends the reply back. It also handles HTTPS: it obtains a free certificate from Let's Encrypt (the "SSL certificate" that proves the server really is your domain) and renews it before it expires, with no configuration beyond naming the domain. Ubuntu 22.04 does not ship Caddy, so these commands add Caddy's official package repository first.
-
-Caddy is not a load balancer in this setup: a load balancer spreads requests across several copies of an app, while here every request goes to the one app container.
-
-### Step 20: Configure Caddy
-
-```bash
-sudo nano /etc/caddy/Caddyfile
-```
-
-Replace the whole file with:
-
-```
-YOUR_DOMAIN, www.YOUR_DOMAIN {
-    reverse_proxy 127.0.0.1:YOUR_APP_PORT
-}
-```
-
-Then apply it:
-
-```bash
-sudo systemctl reload caddy
-```
-
-- The first line lists the names Caddy answers for. Naming real domains is what makes Caddy fetch the HTTPS certificate.
-- `reverse_proxy 127.0.0.1:YOUR_APP_PORT` forwards every request to the app on the loopback address. Use `127.0.0.1`, not `localhost`: `localhost` can resolve to the IPv6 loopback `::1`, where Docker is not listening (Step 13 binds IPv4 only).
-
-### Step 21: Verify HTTPS
+### Step 19: Verify HTTPS
 
 Open `https://YOUR_DOMAIN` in a browser. The first visit can take a few seconds while Caddy obtains the certificate. If it fails:
 
@@ -382,7 +371,7 @@ Open `https://YOUR_DOMAIN` in a browser. The first visit can take a few seconds 
 sudo journalctl -u caddy -n 50   # Caddy's logs, including certificate errors
 ```
 
-The most common cause is DNS not pointing at the droplet yet (Step 17) or port 80/443 blocked by one of the firewalls (Steps 12 and 18).
+The most common cause is DNS not pointing at the droplet yet (Step 17) or port 80/443 blocked by one of the firewalls (Steps 10 and 18).
 
 ---
 
@@ -406,7 +395,7 @@ Traffic between programs on the same droplet (Caddy to the app) uses the interna
 
 ### Docker bypasses UFW
 
-`docker run -p` writes its own low-level firewall rules for published ports, and they are checked before UFW's. A port published on `0.0.0.0` is therefore reachable from the internet even if `ufw status` shows it closed. Two defenses apply here: the app is published on `127.0.0.1` only (Step 13), and the Cloud Firewall, which sits outside the droplet and is unaffected by Docker, does not allow the app's port.
+Publishing a port (`docker run -p`, or `ports:` in a compose file) writes its own low-level firewall rules, and they are checked before UFW's. A port published on `0.0.0.0` is therefore reachable from the internet even if `ufw status` shows it closed. Two defenses apply here: each app is published on `127.0.0.1` only (Step 14), and the Cloud Firewall, which sits outside the droplet and is unaffected by Docker, does not allow the app's port.
 
 ### What `0.0.0.0`, `127.0.0.1` and `localhost` mean
 
@@ -422,7 +411,7 @@ The same digits mean different things depending on where they appear:
 Applied to this setup:
 
 - **Inside the container, the app listens on `0.0.0.0`** (e.g. `uvicorn --host 0.0.0.0` in the app's Dockerfile). This is required, not a risk: a container has its own network and its own `127.0.0.1`. Docker delivers forwarded traffic through the container's network connection, so an app listening on the container's `127.0.0.1` would refuse everything, Caddy included.
-- **On the droplet, the port is published on `127.0.0.1`** (`-p 127.0.0.1:8000:8000`). This is where access is restricted. Rule of thumb: inside a container, always listen on `0.0.0.0`; decide who can reach it with `-p`.
+- **On the droplet, the port is published on `127.0.0.1`** (`127.0.0.1:8000:8000` in `compose.yaml`). This is where access is restricted. Rule of thumb: inside a container, always listen on `0.0.0.0`; decide who can reach it with the published port.
 - **Firewall rules for 80 and 443 use `0.0.0.0/0`**, because the site is public. A rule allowing only `127.0.0.1` would match nothing: loopback traffic never crosses the Cloud Firewall.
 - **SSH (22) could be narrowed** to your own IP (e.g. `["203.0.113.5/32"]`), at the cost of a lockout whenever your home IP changes. Key-only login (Step 6) already makes brute-forcing it infeasible, so it is left open to all.
 
@@ -432,32 +421,29 @@ Browsers ship with a built-in **HSTS preload list** of domains that must only ev
 
 ---
 
-> **Docker Compose alternative**
-> Instead of a long `docker run` command in the service file, you can put the same configuration into a `docker-compose.yml` file in your repo and deploy with `docker compose up -d`. The Docker installation is identical; only the run step changes. Compose becomes especially useful if you later add a database or cache, since each service is just another entry in the file rather than another long `docker run` command.
+## Updating an app
 
----
-
-## Updating the app
+Commit your change, then run the app's deploy script from its repo on your laptop:
 
 ```bash
-ssh deploy@YOUR_DROPLET_IP
-cd /opt/myapp
-git pull
-docker build -t myapp .
-sudo systemctl restart myapp
-sudo systemctl status myapp
+deploy/deploy.sh                       # defaults to deploy@YOUR_DOMAIN
+deploy/deploy.sh deploy@YOUR_DROPLET_IP
 ```
+
+It ships the committed code, rebuilds the image, restarts the container, re-registers the Caddy snippet and waits for the app's health check. Only `HEAD` is deployed, so uncommitted changes are left out (the script warns you).
 
 ---
 
 ## Useful commands
 
 ```bash
-docker logs myapp -f             # tail live app logs
-sudo journalctl -u myapp -f      # systemd-level logs (start/stop events)
-sudo systemctl stop myapp        # stop the app
-sudo systemctl restart myapp     # restart after changes
-docker images                    # list built images on the server
+docker ps                                                            # running containers
+docker logs YOUR_APP -f                                              # tail an app's live logs
+docker compose -f /opt/apps/YOUR_APP/deploy/compose.yaml restart     # restart an app
+docker compose -f /opt/apps/YOUR_APP/deploy/compose.yaml down        # stop and remove an app
+ls /etc/caddy/conf.d                                                 # which sites Caddy serves
+sudo journalctl -u caddy -f                                          # Caddy's logs
+docker images                                                        # list built images on the server
 ```
 
 ---
@@ -480,16 +466,16 @@ If you don't have Homebrew: install it from [brew.sh](https://brew.sh), then run
 ├── main.tf                   # The infrastructure definition: droplet, firewall, SSH key, DNS
 ├── variables.tf              # Declares all input variables and their types/defaults
 ├── outputs.tf                # What Terraform prints after apply (IP address, app URL)
-├── user_data.sh              # Bootstrap script that runs once on first boot
+├── user_data.sh              # Host bootstrap script that runs once on first boot
 ├── terraform.tfvars.example  # A safe template showing what values are needed
 ├── terraform.tfvars          # Your actual secret values: never commit this
 └── .gitignore                # Excludes tfvars, state files, and the .terraform directory
 ```
 
 - **`main.tf`** is the core. It describes what resources to create on DigitalOcean: the droplet, the firewall rules, the SSH key, and the domain with its DNS records. Terraform reads this and figures out what API calls to make. The DNS records reference the droplet's IP, so whenever the droplet is recreated, DNS follows it automatically.
-- **`variables.tf`** lists every input the scripts accept (token, repo URL, port, etc.) without storing any values. It's the contract: `main.tf` references these, and you supply the actual values in `terraform.tfvars`.
-- **`outputs.tf`** tells Terraform what to print when provisioning is done: in this case the droplet's IP address and the app's `https://` URL so you don't have to look them up manually.
-- **`user_data.sh`** is a shell script that DigitalOcean runs automatically on the droplet the first time it boots. It handles everything in the manual guide: installing software, creating users, hardening SSH, starting the app as a service, and setting up Caddy for HTTPS. Terraform fills in its `${...}` placeholders (repo URL, port, password, domain) with `templatefile` before sending it to DigitalOcean. Because it only runs on first boot, any change to it (or to those variables) makes Terraform destroy and recreate the droplet.
+- **`variables.tf`** lists every input the scripts accept (token, host name, region, domain, etc.) without storing any values. It's the contract: `main.tf` references these, and you supply the actual values in `terraform.tfvars`.
+- **`outputs.tf`** tells Terraform what to print when provisioning is done: in this case the droplet's IP address, so you don't have to look it up manually.
+- **`user_data.sh`** is a shell script that DigitalOcean runs automatically on the droplet the first time it boots. It handles Phases 1 and 2 of the manual guide: hardening the server and installing Docker and Caddy. It knows nothing about any app: apps are deployed afterwards from their own repos (see [Adding an app](#adding-an-app)). Terraform fills in its one `${...}` placeholder (the `deploy` password) with `templatefile` before sending it to DigitalOcean. Because it only runs on first boot, any change to it (or to that variable) makes Terraform destroy and recreate the droplet. Keeping app details out of it is what keeps it stable.
 - **`terraform.tfvars.example`** is a committed template that shows what variables need values. It contains no real secrets: just placeholders. Copy it to `terraform.tfvars` and fill it in.
 - **`terraform.tfvars`** is your personal copy with real values: your API token, passwords, and repo URL. It is excluded from git and must never be committed.
 
@@ -512,7 +498,7 @@ Terraform files are typically kept in version control, but not all of them:
 
 The `.gitignore` in the terraform directory already excludes the files that should never be committed. Do not override it.
 
-Terraform automates everything in the manual guide except one step: verifying that your new `deploy` user login works before closing the root session. Since Terraform provisions the SSH key via the DigitalOcean API, you can be confident the key is correctly placed, but you should still SSH in as `deploy` after `apply` completes to confirm before relying on the server.
+Terraform automates Phases 1 and 2 of the manual guide, except one step: verifying that your new `deploy` user login works before closing the root session. Phase 3 (deploying an app) is done per app, from the app's own repo. Since Terraform provisions the SSH key via the DigitalOcean API, you can be confident the key is correctly placed, but you should still SSH in as `deploy` after `apply` completes to confirm before relying on the server.
 
 The bootstrap script (`user_data.sh`) runs once on first boot and handles:
 - System updates
@@ -520,11 +506,11 @@ The bootstrap script (`user_data.sh`) runs once on first boot and handles:
 - Installing git and Docker
 - Creating the `deploy` sudo user and copying your SSH key to them
 - Disabling root SSH login and password authentication
-- Cloning the repo and building the Docker image
-- Starting the app as a systemd service running as `deploy`, published on `127.0.0.1` only
-- Installing Caddy and configuring it to serve the domain over HTTPS
+- Installing Caddy, with a main Caddyfile that only imports `/etc/caddy/conf.d/*.caddy`
+- Letting `deploy` write Caddy snippets and reload Caddy without a password (nothing else)
+- Creating `/opt/apps`, where each app is deployed
 
-Terraform itself handles the Cloud Firewall (22, 80 and 443 only) and the DNS records. Buying the domain and pointing its nameservers to DigitalOcean (Step 16) is the one part you do by hand at the registrar.
+Terraform itself handles the Cloud Firewall (22, 80 and 443 only) and the DNS records for `domain_name`. Buying the domain and pointing its nameservers to DigitalOcean (Step 16) is the one part you do by hand at the registrar.
 
 ### Generating a DigitalOcean API token
 
@@ -562,12 +548,10 @@ Open `terraform.tfvars` and fill in all values. The required ones:
 | Variable | Description |
 |---|---|
 | `do_token` | DigitalOcean API token |
-| `repo_url` | HTTPS URL of your GitHub repo (must contain a Dockerfile) |
 | `deploy_password` | Password for the `deploy` user (used for sudo) |
-| `app_port` | Port your app listens on inside the container |
-| `domain_name` | Your domain without `www` (e.g. `example.com`), with nameservers already pointed to DigitalOcean (Step 16) |
+| `domain_name` | Your domain without `www` (e.g. `example.com`), with nameservers already pointed to DigitalOcean (Step 16). Terraform creates its `@` and `www` A records |
 
-The repo must be **public**: the droplet clones it over HTTPS without credentials, and for a private (or misspelled) repo GitHub asks for a username, which fails the unattended boot script with `could not read Username for 'https://github.com'`.
+The optional ones (`host_name`, `region`, `size`, `ssh_public_key_path`, `project_name`) have defaults in `variables.tf`. No app details are needed here: the droplet starts with no app on it.
 
 ### Moving an existing domain into Terraform (one-time)
 
@@ -600,7 +584,9 @@ terraform plan
 terraform apply
 ```
 
-After `apply`, Terraform prints the droplet IP and app URL. The bootstrap script runs in the background: wait about 3 to 5 minutes for it to complete before testing. If the droplet was recreated, its IP changed: Terraform updates the DNS records, but caches across the internet may serve the old IP for a while.
+After `apply`, Terraform prints the droplet IP. The bootstrap script runs in the background: wait about 3 to 5 minutes for it to complete before testing. If the droplet was recreated, its IP changed: Terraform updates the DNS records, but caches across the internet may serve the old IP for a while, so deploy to the IP directly (`deploy/deploy.sh deploy@YOUR_DROPLET_IP`). SSH will also warn that the host key changed, because it is a new machine: clear the old entry with `ssh-keygen -R YOUR_DROPLET_IP` (and `ssh-keygen -R YOUR_DOMAIN`).
+
+The droplet has no app on it yet: deploy one as described in [Adding an app](#adding-an-app).
 
 ### Verify
 
@@ -612,13 +598,37 @@ ssh deploy@YOUR_DROPLET_IP
 cloud-init status --long
 sudo tail -n 40 /var/log/cloud-init-output.log   # the error is usually at the bottom
 
-# On the droplet: is the app running?
-curl http://127.0.0.1:YOUR_APP_PORT
+# On the droplet: are Docker and Caddy up, and is the apps directory there?
+docker --version
+systemctl is-active caddy
+ls /opt/apps /etc/caddy/conf.d
 ```
 
-Then open `https://YOUR_DOMAIN` in a browser.
+An empty `/opt/apps` and `conf.d` is correct at this point.
 
 The boot script stops at the first failing command (`set -euo pipefail`), so everything after a failure is skipped. The rendered script, with all variables filled in, is at `/var/lib/cloud/instance/user-data.txt`. It is readable by root only because it contains `deploy_password` in plain text (which is also stored in `terraform.tfstate`).
+
+### Adding an app
+
+The host knows nothing about your apps, so adding one never touches this repo's code (apart from a DNS record for a new subdomain, below). Copy the `deploy/` folder of an existing app, such as the `website` repo's, into the new app's repo and change the names:
+
+1. **`compose.yaml`**: the app name, and a port that no other app on the droplet uses (8000, 8001, ...).
+2. **`YOUR_APP.caddy`**: the domain(s) the app answers on, and the same port.
+3. **`deploy.sh`**: the `app` and `port` variables at the top.
+4. **DNS**: the `@` and `www` records of `domain_name` already point at the droplet. For another subdomain, add a record to `main.tf`:
+
+   ```hcl
+   resource "digitalocean_record" "blog" {
+     domain = digitalocean_domain.main.id
+     type   = "A"
+     name   = "blog"
+     value  = digitalocean_droplet.host.ipv4_address
+   }
+   ```
+
+5. **Deploy**: commit, then run `deploy/deploy.sh` from the app's repo.
+
+The app's `.caddy` file is what names its domains: `domain_name` in Terraform only controls DNS. Removing an app is `docker compose down` and deleting its file from `/etc/caddy/conf.d`, followed by `sudo systemctl reload caddy`.
 
 ### Tear down
 
@@ -634,11 +644,12 @@ terraform destroy
 |---|---|
 | Site isn't reachable | Check `dig +short YOUR_DOMAIN` returns the droplet IP, ports 80/443 are open in both firewalls, and `sudo journalctl -u caddy -n 50` |
 | Browser fails on `http://YOUR_DOMAIN:8000` | Expected: the app port is private, and `.dev`/`.app` domains are HTTPS-only in browsers. Use `https://YOUR_DOMAIN` |
-| `/opt/myapp` missing on the droplet | The boot script failed before cloning: check `/var/log/cloud-init-output.log` |
-| `could not read Username for 'https://github.com'` | The repo is private or `repo_url` is wrong: see [Setup](#setup) |
+| `/opt/apps` missing on the droplet | The boot script failed before the last step: check `/var/log/cloud-init-output.log` |
 | `terraform apply` fails creating the domain | It already exists in DigitalOcean: [import it](#moving-an-existing-domain-into-terraform-one-time) |
-| Container exits immediately | `docker logs myapp` to see the error from inside the container |
+| Container exits immediately | `docker logs YOUR_APP` to see the error from inside the container |
 | `docker build` fails | Confirm a `Dockerfile` exists in the repo root and the build succeeds locally first |
 | Port already in use | `sudo fuser -k YOUR_APP_PORT/tcp` |
-| Updated code not showing | `git pull && docker build -t myapp . && sudo systemctl restart myapp` |
-| Service fails to start | `sudo journalctl -u myapp -n 50` to see systemd-level errors |
+| Updated code not showing | Commit first: a deploy ships `HEAD` only. Then rerun `deploy/deploy.sh` |
+| `deploy.sh` hangs or asks for a password at the Caddy reload | The sudoers rule is missing or has a typo: `sudo -l` as `deploy` lists what it may run without a password (Step 13) |
+| Caddy reload fails | A snippet in `/etc/caddy/conf.d` has a syntax error: `sudo journalctl -u caddy -n 50`. The previous config keeps running meanwhile |
+| SSH says `REMOTE HOST IDENTIFICATION HAS CHANGED` | The droplet was recreated and is a new machine: `ssh-keygen -R YOUR_DROPLET_IP` |
