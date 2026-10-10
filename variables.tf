@@ -42,5 +42,5 @@ variable "domain_name" {
 variable "project_name" {
   description = "DigitalOcean project to place the droplet in (created if it doesn't exist)"
   type        = string
-  default     = "bay-quant"
+  default     = "bayquant"
 }
